@@ -8,36 +8,27 @@
    cl -Ox mcmcMSC2s-HPC.c -link libpthreadVC3.lib
    ./mcmcMSC2s-HPC <datafile>
 */
-#include<stdio.h>
-#include<stdlib.h>
-#include<string.h>
-#include<math.h>
-#include<time.h>
-#include<pthread.h>
 
 #if(defined(__linux__))
 #define _GNU_SOURCE
 #include<sched.h>
 #include<unistd.h>
-#include <sys/resource.h>
-#include <sys/sysinfo.h>
-
-void pin_to_core(int t)
-{
-   cpu_set_t cpuset;
-   CPU_ZERO(&cpuset);
-   CPU_SET(t, &cpuset);
-   if (pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset)) {
-      printf("Error while pinning thread to core. ");
-      exit(-1);
-   }
-}
+//#include <sys/resource.h>
+//#include <sys/sysinfo.h>
 #endif
 
-#define NTHREADS 16
-#define NLOCI 15000  /* This should be larger than 14663, the number of loci in total */
+#include<pthread.h>
+#include<stdio.h>
+#include<stdlib.h>
+#include<string.h>
+#include<math.h>
+#include<time.h>
 
+#define NLOCI 15000  /* This should be larger than 14663, the number of loci in total */
+#define NTHREADS 8
+#define PIN_THREADS_CORE 
 int parallelize_tau_move = 1;
+
 
 struct data_s {
    int nloci, ni[NLOCI], xi[NLOCI];
@@ -197,13 +188,27 @@ int update_times(int locus_start, int nloci, int thread_id)
    return (naccept);
 }
 
+#if(defined(__linux__) && defined(PIN_THREADS_CORE))
+void pin_to_core(int t)
+{
+   cpu_set_t cpuset;
+   CPU_ZERO(&cpuset);
+   CPU_SET(t, &cpuset);
+   if (pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset)) {
+      printf("Error while pinning thread to core. ");
+      exit(-1);
+   }
+}
+#endif
+
 void* thread_worker(void* arg)
 {
    int id = (int)arg;
    int l0 = thread_data[id].locus_start, l1 = l0 + thread_data[id].nloci;
-   int threads_start = 0; 
+   int threads_start = (parallelize_tau_move == 0 ? 0 : 18);  /* for running two jobs on potto */
+   // int threads_start = 0;
 
-#if (defined(__linux__))
+#if(defined(__linux__) && defined(PIN_THREADS_CORE))
    pin_to_core(threads_start + id);
 #endif
    pthread_mutex_lock(&thread_data[id].mutex);
