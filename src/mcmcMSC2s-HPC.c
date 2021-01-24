@@ -6,7 +6,7 @@
    gcc -o mcmcMSC2s-HPC -Wno-unused-result -O3 mcmcMSC2s-HPC.c -lm -lpthread
    icc -o mcmcMSC2s-HPC -O3 mcmcMSC2s-HPC.c -lm -lpthread
    cl -Ox mcmcMSC2s-HPC.c -link libpthreadVC3.lib
-   ./mcmcMSC2s <datafile>
+   ./mcmcMSC2s-HPC <datafile>
 */
 #include<stdio.h>
 #include<stdlib.h>
@@ -15,12 +15,12 @@
 #include<time.h>
 #include<pthread.h>
 
-#if(defined(__linux__) && 0)
+#if(defined(__linux__))
 #define _GNU_SOURCE
 #include<sched.h>
 #include<unistd.h>
-//#include <sys/resource.h>
-//#include <sys/sysinfo.h>
+#include <sys/resource.h>
+#include <sys/sysinfo.h>
 
 void pin_to_core(int t)
 {
@@ -28,18 +28,20 @@ void pin_to_core(int t)
    CPU_ZERO(&cpuset);
    CPU_SET(t, &cpuset);
    if (pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset)) {
-      puts("Error while pinning thread to core. ");
+      printf("Error while pinning thread to core. ");
       exit(-1);
    }
 }
 #endif
 
-#define NTHREADS 4
+#define NTHREADS 16
 #define NLOCI 15000  /* This should be larger than 14663, the number of loci in total */
+
+int parallelize_tau_move = 1;
 
 struct data_s {
    int nloci, ni[NLOCI], xi[NLOCI];
-   double wtau, wtheta, wt, tau, theta, t[NLOCI];
+   double wtau, wtheta, wt, tau, theta, t[NLOCI], taunew;
    int nr, burnin;
 }  data;
 
@@ -48,8 +50,10 @@ struct thread_data_s {
    pthread_mutex_t mutex;
    pthread_cond_t cond;
 
-   volatile int work;   /* -1: end; 0: idle waiting for work; 1 2 3 etc.: work to do */
-   int id, locus_start, nloci, naccept_age;
+   /* work: -1: end; 0: idle waiting for work; 1: update_times; 2: loglike calculation */
+   volatile int work;
+   int id, locus_start, nloci, naccept_ti;
+   double lnlike;
 }  thread_data[NTHREADS];
 
 int nthreads = NTHREADS;
@@ -135,12 +139,12 @@ void read_data(char datafile[], double* theta, double* tau, double t[])
    printf("\nSampling starts after burnin (%d)...\n", data.burnin);
 }
 
-/* log prior */
+/* log f(tau, theta)f(ti|tau, theta), log density of tau & theta priors and of ti */
 double logprior(double tau, double theta, double ti[])
 {
    int i;
    double mu_tau = 0.005, mu_theta = 0.001;
-   double lnp = 0, p, sumt = 0;
+   double lnp = 0, sumt = 0;
 
    lnp = -tau / mu_tau - theta / mu_theta;
    for (i = 0; i < data.nloci; i++) sumt += ti[i];
@@ -149,17 +153,19 @@ double logprior(double tau, double theta, double ti[])
 }
 
 /* log likelihood */
-double loglikelihood(double tau, double ti[])
+double loglikelihood(double tau, double ti[], int locus_start, int nloci, int thread_id)
 {
    int i;
    double lnp = 0, p, sumt = 0;
 
-   for (i = 0; i < data.nloci; i++) {
+   for (i = locus_start; i < locus_start + nloci; i++) {
       p = 0.75 - 0.75 * exp(-8.0 * (tau + ti[i]) / 3);
       lnp += data.xi[i] * log(p) + (data.ni[i] - data.xi[i]) * log(1 - p);
    }
+   if (nthreads > 1) thread_data[thread_id].lnlike = lnp;
    return(lnp);
 }
+
 
 double logacceptanceratio_locus(int locus, double ti, double tinew, double tau, double theta)
 {
@@ -198,7 +204,7 @@ void* thread_worker(void* arg)
    int threads_start = 0; 
 
 #if (defined(__linux__))
-   // pin_to_core(threads_start + id);
+   pin_to_core(threads_start + id);
 #endif
    pthread_mutex_lock(&thread_data[id].mutex);
    /* loop until signalled to quit */
@@ -208,7 +214,15 @@ void* thread_worker(void* arg)
          pthread_cond_wait(&thread_data[id].cond, &thread_data[id].mutex);
       if (thread_data[id].work > 0) {
          if (debug) printf("Thread %d working, loci %5d -%5d\n", id, l0 + 1, l1 + 1);
-         thread_data[id].naccept_age = update_times(thread_data[id].locus_start, thread_data[id].nloci, id);
+
+         /* work: -1: end; 0: idle waiting for work; 1: update_times; 2: loglike calculation */
+         if (thread_data[id].work == 1)
+            thread_data[id].naccept_ti = update_times(thread_data[id].locus_start, thread_data[id].nloci, id);
+         else if (thread_data[id].work == 2)
+            loglikelihood(data.taunew, data.t, thread_data[id].locus_start, thread_data[id].nloci, id);
+         else
+            printf("thread work not recognised...");
+
          if (debug) printf("\t\t\t\tThread %d finished, loci %5d -%5d\n", id, l0 + 1, l1 + 1);
          thread_data[id].work = 0;
          pthread_cond_signal(&thread_data[id].cond);
@@ -271,17 +285,18 @@ int main(int argc, char* argv[])
    FILE* fout = (FILE*)fopen("mcmc.txt", "w");
    char datafile[1024] = "HC.SitesDiffs.txt", timestr[64];
    int i, ir, nround = 0;
-   double lnprior, lnpriornew, lnlike, lnlikenew, lnacceptance, taunew, thetanew, meantau = 0, meantheta = 0;
+   double lnprior, lnpriornew, lnlike, lnlikenew, lnacceptance, thetanew, meantau = 0, meantheta = 0;
    double naccept[3] = { 0 };
 
-   printf("Usage:\n   mcmcMSC2s <datafile>\n");
+   printf("Usage:\n   mcmcMSC2s-HPC <datafile>\n");
    if (argc > 1) strcpy(datafile, argv[1]);
    if (fout == NULL) puts("outfile open error");   
    read_data(datafile, &data.theta, &data.tau, data.t);
    starttimer();
    for (i = 0; i < nthreads; i++)  SetSeed(-1, i);
    lnprior = logprior(data.tau, data.theta, data.t);
-   lnlike = loglikelihood(data.tau, data.t);
+   lnlike = loglikelihood(data.tau, data.t, 0, data.nloci, 0);
+
    printf("N = %5d w_tau w_theta w_t = %9.6f%9.6f%9.6f\n", data.nr, data.wtau, data.wtheta, data.wt);
    printf("initials (tau theta): %9.6f%9.6f  lnp0 = %9.3f %9.3f\n", data.tau, data.theta, lnprior, lnlike);
 
@@ -307,14 +322,22 @@ int main(int argc, char* argv[])
          naccept[0] = naccept[1] = naccept[2] = 0;
       }
       nround++;
-      /* change tau, serial move */
-      taunew = data.tau + (rndu(0) - 0.5) * data.wtau;
-      if (taunew < 0) taunew = -taunew;
-      lnpriornew = logprior(taunew, data.theta, data.t);
-      lnlikenew = loglikelihood(taunew, data.t);
+      /* change tau, using serial or parallel loglike calculation (parallelize_tau_move) */
+      data.taunew = data.tau + (rndu(0) - 0.5) * data.wtau;
+      if (data.taunew < 0) data.taunew = -data.taunew;
+      if (parallelize_tau_move) {
+         /* work: -1: end; 0: idle waiting for work; 1: update_times; 2: loglike calculation */
+         threads_wakeup((int)2, NULL);
+         for (i = 0, lnlikenew = 0; i < nthreads; i++)
+            lnlikenew += thread_data[i].lnlike;
+      }
+      else {
+         lnlikenew = loglikelihood(data.taunew, data.t, 0, data.nloci, 0);
+      }
+      lnpriornew = logprior(data.taunew, data.theta, data.t);
       lnacceptance = lnpriornew - lnprior + lnlikenew - lnlike;
       if (lnacceptance >= 0 || rndu(0) < exp(lnacceptance)) {  /* accept */
-         data.tau = taunew;
+         data.tau = data.taunew;
          lnprior = lnpriornew;  lnlike = lnlikenew;
          naccept[0]++;
       }
@@ -332,12 +355,13 @@ int main(int argc, char* argv[])
       if (nthreads <= 1)
          naccept[2] += update_times(0, data.nloci, 0);
       else {
+         /* work: -1: end; 0: idle waiting for work; 1: update_times; 2: loglike calculation */
          threads_wakeup((int)1, NULL);
          for (i = 0; i < nthreads; i++)
-            naccept[2] += (double)thread_data[i].naccept_age / data.nloci;
+            naccept[2] += (double)thread_data[i].naccept_ti / data.nloci;
       }
       lnprior = logprior(data.tau, data.theta, data.t);
-      lnlike = loglikelihood(data.tau, data.t);
+      lnlike = loglikelihood(data.tau, data.t, 0, data.nloci, 0);
 
       if (ir >= 0) fprintf(fout, "%.6f\t%.6f\n", data.tau, data.theta);
       meantau += data.tau;
