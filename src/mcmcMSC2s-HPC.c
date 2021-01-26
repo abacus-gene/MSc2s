@@ -25,10 +25,13 @@
 #include<time.h>
 
 #define NLOCI 15000  /* This should be larger than 14663, the number of loci in total */
-#define NTHREADS 8
+#define NTHREADS 18
 #define PIN_THREADS_CORE 
 int parallelize_tau_move = 1;
+int nthreads = NTHREADS, thread_start = 0;
 
+unsigned int z_rndu[NTHREADS] = { 1,3,5,7 };
+int debug = 0;
 
 struct data_s {
    int nloci, ni[NLOCI], xi[NLOCI];
@@ -47,9 +50,6 @@ struct thread_data_s {
    double lnlike;
 }  thread_data[NTHREADS];
 
-int nthreads = NTHREADS;
-unsigned int z_rndu[NTHREADS*4] = {1,3,5,7};   /* if(nthreads > NTHREADS) */
-int debug = 0;
 
 double rndu(int thread_id)
 {
@@ -88,7 +88,7 @@ char* printtime(char timestr[])
    return(timestr);
 }
 
-void read_data(char datafile[], double* theta, double* tau, double t[])
+void read_data(char datafile[], double* tau, double* theta, double t[])
 {
    FILE* fin;
    char line[1024];
@@ -98,8 +98,8 @@ void read_data(char datafile[], double* theta, double* tau, double t[])
    // data.nloci = 1000;
    data.nloci = 14663;
    data.wtau = 0.0005;  data.wtheta = 0.0005;  data.wt = 0.0123;
-   data.nr = 100000; data.burnin = 8000;
-   *tau = 0.01;  *theta = 0.01;
+   data.nr = 100000; data.burnin = 000;
+   *tau = 0.004;  *theta = 0.004;
    /* data.nloci = 14663; */
    fin = (FILE*)fopen(datafile, "r");
    if (fin == NULL) puts("data file open error");
@@ -113,7 +113,6 @@ void read_data(char datafile[], double* theta, double* tau, double t[])
    printf("read in %5d loci\n", data.nloci);
    printf("average sequence divergence = %6.0f/%6.0f = %9.6f\n", xtotal, ntotal, xtotal / ntotal);
 
-   /* read_data */
    for (i = 0; i < data.nloci; i++)
       t[i] = - *theta / 2 * (0.5 - rndu(0));   /* initial values, 0.5-1.5 times theta0/2 */
 
@@ -128,6 +127,12 @@ void read_data(char datafile[], double* theta, double* tau, double t[])
    printf("Window sizes (tau theta ti): %9.6f%9.6f%9.6f\n", data.wtau, data.wtheta, data.wt);
    printf("\nRunning MCMC to collect %d samples in mcmc.txt...", data.nr);
    printf("\nSampling starts after burnin (%d)...\n", data.burnin);
+
+   printf("input nthreads starting_thread: ");
+   scanf("%d%d", &nthreads, &thread_start);
+   if (nthreads > NTHREADS) {
+      printf("nthreads > %d.", NTHREADS);
+   }
 }
 
 /* log f(tau, theta)f(ti|tau, theta), log density of tau & theta priors and of ti */
@@ -138,7 +143,8 @@ double logprior(double tau, double theta, double ti[])
    double lnp = 0, sumt = 0;
 
    lnp = -tau / mu_tau - theta / mu_theta;
-   for (i = 0; i < data.nloci; i++) sumt += ti[i];
+   for (i = 0; i < data.nloci; i++)
+      sumt += ti[i];
    lnp += data.nloci * log(2 / theta) - 2 / theta * sumt;
    return(lnp);
 }
@@ -205,11 +211,9 @@ void* thread_worker(void* arg)
 {
    int id = (int)arg;
    int l0 = thread_data[id].locus_start, l1 = l0 + thread_data[id].nloci;
-   int threads_start = (parallelize_tau_move == 0 ? 0 : 18);  /* for running two jobs on potto */
-   // int threads_start = 0;
 
 #if(defined(__linux__) && defined(PIN_THREADS_CORE))
-   pin_to_core(threads_start + id);
+   pin_to_core(thread_start - 1 + id);
 #endif
    pthread_mutex_lock(&thread_data[id].mutex);
    /* loop until signalled to quit */
@@ -287,7 +291,7 @@ void threads_exit()
 
 int main(int argc, char* argv[])
 {
-   FILE* fout = (FILE*)fopen("mcmc.txt", "w");
+   FILE* fmcmc = (FILE*)fopen("mcmc.txt", "w");
    char datafile[1024] = "HC.SitesDiffs.txt", timestr[64];
    int i, ir, nround = 0;
    double lnprior, lnpriornew, lnlike, lnlikenew, lnacceptance, thetanew, meantau = 0, meantheta = 0;
@@ -295,8 +299,8 @@ int main(int argc, char* argv[])
 
    printf("Usage:\n   mcmcMSC2s-HPC <datafile>\n");
    if (argc > 1) strcpy(datafile, argv[1]);
-   if (fout == NULL) puts("outfile open error");   
-   read_data(datafile, &data.theta, &data.tau, data.t);
+   if (fmcmc == NULL) puts("outfile open error");   
+   read_data(datafile, &data.tau, &data.theta, data.t);
    starttimer();
    for (i = 0; i < nthreads; i++)  SetSeed(-1, i);
    lnprior = logprior(data.tau, data.theta, data.t);
@@ -312,7 +316,7 @@ int main(int argc, char* argv[])
          thread_data[i].nloci = per_thread + (remaining > 0 ? 1 : 0);
          if (remaining) remaining--;
          start += thread_data[i].nloci;
-         printf("Thread %d : loci %5d -- %5d\n", i, thread_data[i].locus_start + 1, thread_data[i].locus_start + thread_data[i].nloci);
+         printf("Thread %d : loci %5d -- %5d\n", i+1, thread_data[i].locus_start + 1, thread_data[i].locus_start + thread_data[i].nloci);
       }
       threads_init();
    }
@@ -322,23 +326,21 @@ int main(int argc, char* argv[])
    for (ir = -data.burnin; ir < data.nr; ir++) {   /* loop over nr iterations */
       if (debug) printf("\nmcmc round %2d\n", ir);
       if (ir == 0) {
-         nround = 0;
-         meantau = meantheta = 0;
-         naccept[0] = naccept[1] = naccept[2] = 0;
+         nround = 0;  meantau = meantheta = 0;  naccept[0] = naccept[1] = naccept[2] = 0;
       }
       nround++;
+      
       /* change tau, using serial or parallel loglike calculation (parallelize_tau_move) */
       data.taunew = data.tau + (rndu(0) - 0.5) * data.wtau;
       if (data.taunew < 0) data.taunew = -data.taunew;
-      if (parallelize_tau_move) {
+      if (nthreads>1 && parallelize_tau_move) {
          /* work: -1: end; 0: idle waiting for work; 1: update_times; 2: loglike calculation */
          threads_wakeup((int)2, NULL);
          for (i = 0, lnlikenew = 0; i < nthreads; i++)
             lnlikenew += thread_data[i].lnlike;
       }
-      else {
+      else
          lnlikenew = loglikelihood(data.taunew, data.t, 0, data.nloci, 0);
-      }
       lnpriornew = logprior(data.taunew, data.theta, data.t);
       lnacceptance = lnpriornew - lnprior + lnlikenew - lnlike;
       if (lnacceptance >= 0 || rndu(0) < exp(lnacceptance)) {  /* accept */
@@ -346,6 +348,7 @@ int main(int argc, char* argv[])
          lnprior = lnpriornew;  lnlike = lnlikenew;
          naccept[0]++;
       }
+
       /* change theta, serial move, no need to calculate likelihood */
       thetanew = data.theta + (rndu(0) - 0.5) * data.wtheta;
       if (thetanew < 0) thetanew = -thetanew;
@@ -356,19 +359,22 @@ int main(int argc, char* argv[])
          lnprior = lnpriornew;
          naccept[1]++;
       }
+
       /* Change ti for all loci.  This can be done in parrallel.  */
-      if (nthreads <= 1)
-         naccept[2] += update_times(0, data.nloci, 0);
-      else {
+      if (nthreads > 1) {
          /* work: -1: end; 0: idle waiting for work; 1: update_times; 2: loglike calculation */
          threads_wakeup((int)1, NULL);
          for (i = 0; i < nthreads; i++)
             naccept[2] += (double)thread_data[i].naccept_ti / data.nloci;
       }
+      else
+         naccept[2] += (double)update_times(0, data.nloci, 0) / data.nloci;
+      /* update lnprior and lnlike as the ti moves do not keep them up to date. */
       lnprior = logprior(data.tau, data.theta, data.t);
       lnlike = loglikelihood(data.tau, data.t, 0, data.nloci, 0);
 
-      if (ir >= 0) fprintf(fout, "%.6f\t%.6f\n", data.tau, data.theta);
+      if (ir == -data.burnin || ir >= 0) 
+         fprintf(fmcmc, "%.6f\t%.6f\n", data.tau, data.theta);
       meantau += data.tau;
       meantheta += data.theta;
       if ((ir + 1) % 1000 == 0) {
@@ -378,6 +384,6 @@ int main(int argc, char* argv[])
       }
    }
    if (nthreads > 1) threads_exit();
-   fclose(fout);
+   fclose(fmcmc);
    printf("\nTime used: %s\n", printtime(timestr));
 }
