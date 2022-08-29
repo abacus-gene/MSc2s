@@ -114,7 +114,7 @@ void read_data(char datafile[], double* tau, double* theta, double t[])
    printf("average sequence divergence = %6.0f/%6.0f = %9.6f\n", xtotal, ntotal, xtotal / ntotal);
 
    for (i = 0; i < data.nloci; i++)
-      t[i] = - *theta / 2 * (0.5 - rndu(0));   /* initial values, 0.5-1.5 times theta0/2 */
+      t[i] = *theta / 2 * (0.5 + rndu(0));   /* initial values, 0.5-1.5 times theta0/2 */
 
    printf("\ninput L (number of loci, between 1 and 14663) (e.g., type  1000 Enter)?\n");
    scanf("%d", &data.nloci);
@@ -135,7 +135,23 @@ void read_data(char datafile[], double* tau, double* theta, double t[])
    }
 }
 
-/* log f(tau, theta)f(ti|tau, theta), log density of tau & theta priors and of ti */
+/* log density of tau & theta priors and of ti: log f(tau, theta)f(ti|tau, theta) */
+#if(1)
+double logprior(double tau, double theta, double ti[])
+{
+   double a_tau = 2, b_tau = 400, a_theta = 2, b_theta = 1000;
+   int i;
+   double lnp = 0, p, sumt = 0;
+
+   /* gamma prior on tau and gamma prior on theta */
+   lnp = (a_tau - 1) * log(tau) - b_tau * tau + (a_theta - 1) * log(theta) - b_theta * theta;
+   /* exp densities for t */
+   for (i = 0; i < data.nloci; i++)
+      sumt += ti[i];
+   lnp += data.nloci * log(2 / theta) - 2 / theta * sumt;
+   return (lnp);
+}
+#else
 double logprior(double tau, double theta, double ti[])
 {
    int i;
@@ -148,17 +164,24 @@ double logprior(double tau, double theta, double ti[])
    lnp += data.nloci * log(2 / theta) - 2 / theta * sumt;
    return(lnp);
 }
-
+#endif
 /* log likelihood */
 double loglikelihood(double tau, double ti[], int locus_start, int nloci, int thread_id)
 {
-   int i;
-   double lnp = 0, p, sumt = 0;
+   int use_jc = 0, i;
+   double lnp = 0, p, lambda;
 
-   for (i = locus_start; i < locus_start + nloci; i++) {
-      p = 0.75 - 0.75 * exp(-8.0 * (tau + ti[i]) / 3);
-      lnp += data.xi[i] * log(p) + (data.ni[i] - data.xi[i]) * log(1 - p);
-   }
+   if (use_jc)
+      for (i = locus_start; i < locus_start + nloci; i++) {
+         p = 0.75 - 0.75 * exp(-8.0 * (tau + ti[i]) / 3);
+         lnp += data.xi[i] * log(p) + (data.ni[i] - data.xi[i]) * log(1 - p);
+      }
+   else
+      for (i = locus_start; i < locus_start + nloci; i++) {
+         lambda = 2 * data.ni[i] * (tau + ti[i]);
+         lnp += data.xi[i] * log(lambda) - lambda;
+      }
+
    if (nthreads > 1) thread_data[thread_id].lnlike = lnp;
    return(lnp);
 }
