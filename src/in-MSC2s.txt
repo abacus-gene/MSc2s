@@ -1,0 +1,7 @@
+14663
+200000 .001 .001 .0011 .0022 .0033  
+
+// end of file
+input L (number of loci, between 1 and 14663) (e.g., type  1000 Enter)? 14663
+input N  tau_initial  theta_inital  w_tau  w_theta  w_ti: 200000 .01 .01 .01 .01 .01
+Window sizes (for tau theta ti)?  0.0011 0.0022 0.0033
